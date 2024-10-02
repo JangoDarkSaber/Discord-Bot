@@ -4,6 +4,7 @@ import yt_dlp
 import asyncio
 import logging
 import os
+import json
 from dotenv import load_dotenv
 
 # =========================
@@ -15,7 +16,8 @@ TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 PRIORITY_USER_ID = int(os.getenv('PRIORITY_USER_ID'))
 BLOCKED_USER_ID = int(os.getenv('BLOCKED_USER_ID'))
 DJ_ROLE_NAME = os.getenv('DJ_ROLE_NAME', 'DJ')  # Defaults to 'DJ' if not set
-MP3_FILE_PATH = os.getenv('MP3_FILE_PATH', 'audio/welcome.mp3')  # Default path
+DEFAULT_MP3_FILE_PATH = os.getenv('DEFAULT_MP3_FILE_PATH', 'audio/welcome.mp3')  # Default welcome sound
+WELCOME_SOUNDS_FILE = 'welcome_sounds.json'  # JSON file to store user-specific welcome sounds
 
 # =========================
 # Configure Logging
@@ -40,6 +42,30 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Global dictionary to store queues for each guild
 music_queues = {}
+
+# =========================
+# Load Welcome Sounds
+# =========================
+
+def load_welcome_sounds():
+    """Loads the welcome sounds from the JSON file."""
+    if not os.path.isfile(WELCOME_SOUNDS_FILE):
+        with open(WELCOME_SOUNDS_FILE, 'w') as f:
+            json.dump({}, f)
+        return {}
+    with open(WELCOME_SOUNDS_FILE, 'r') as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            logging.error("welcome_sounds.json is not a valid JSON file.")
+            return {}
+
+def save_welcome_sounds(welcome_sounds):
+    """Saves the welcome sounds to the JSON file."""
+    with open(WELCOME_SOUNDS_FILE, 'w') as f:
+        json.dump(welcome_sounds, f, indent=4)
+
+welcome_sounds = load_welcome_sounds()
 
 # =========================
 # Helper Functions
@@ -115,52 +141,63 @@ async def on_command_error(ctx, error):
 async def on_voice_state_update(member, before, after):
     """
     Event listener that triggers when a user's voice state changes.
-    If the priority user joins a voice channel, the bot joins, plays the MP3,
+    If any user joins a voice channel, the bot joins, plays the corresponding MP3,
     and then disconnects after the audio finishes.
     """
-    # Check if the member is the priority user and has just joined a voice channel
-    if member.id == PRIORITY_USER_ID:
-        if before.channel is None and after.channel is not None:
-            # Priority user has joined a voice channel
-            voice_channel = after.channel
-            # Check if the bot is already connected to a voice channel in this guild
-            voice_client = discord.utils.get(bot.voice_clients, guild=member.guild)
-            if voice_client and voice_client.is_connected():
-                if voice_client.channel != voice_channel:
-                    try:
-                        await voice_client.move_to(voice_channel)
-                    except Exception as e:
-                        logging.error(f"Error moving to voice channel: {e}")
-                        return
-            else:
+    # Avoid bot's own voice state changes
+    if member.bot:
+        return
+
+    # Check if the member has just joined a voice channel
+    if before.channel is None and after.channel is not None:
+        guild = member.guild
+        voice_channel = after.channel
+        user_id = str(member.id)
+
+        # Determine which MP3 to play
+        mp3_file = welcome_sounds.get(user_id, DEFAULT_MP3_FILE_PATH)
+
+        # Check if the MP3 file exists
+        if not os.path.isfile(mp3_file):
+            logging.error(f"MP3 file not found for user {member.name} ({user_id}): {mp3_file}")
+            return
+
+        # Check if the bot is already connected to a voice channel in this guild
+        voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+
+        if voice_client and voice_client.is_connected():
+            if voice_client.channel != voice_channel:
                 try:
-                    voice_client = await voice_channel.connect()
+                    await voice_client.move_to(voice_channel)
                 except Exception as e:
-                    logging.error(f"Error connecting to voice channel: {e}")
+                    logging.error(f"Error moving to voice channel: {e}")
                     return
+        else:
+            try:
+                voice_client = await voice_channel.connect()
+            except Exception as e:
+                logging.error(f"Error connecting to voice channel: {e}")
+                return
 
-            # Play the MP3 file
-            if os.path.isfile(MP3_FILE_PATH):
-                try:
-                    source = discord.FFmpegPCMAudio(MP3_FILE_PATH)
-                    if not voice_client.is_playing():
-                        # Define a callback to disconnect after the audio finishes
-                        def after_playing(error):
-                            coro = voice_client.disconnect()
-                            fut = asyncio.run_coroutine_threadsafe(coro, bot.loop)
-                            try:
-                                fut.result()
-                            except:
-                                pass
+        # Play the MP3 file
+        try:
+            source = discord.FFmpegPCMAudio(mp3_file)
+            if not voice_client.is_playing():
+                # Define a callback to disconnect after the audio finishes
+                def after_playing(error):
+                    coro = voice_client.disconnect()
+                    fut = asyncio.run_coroutine_threadsafe(coro, bot.loop)
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        logging.error(f"Error disconnecting after playing: {e}")
 
-                        voice_client.play(source, after=after_playing)
-                        # Send a message to the system channel if available
-                        if member.guild.system_channel:
-                            await member.guild.system_channel.send(f"Playing welcome sound for {member.mention}!")
-                except Exception as e:
-                    logging.error(f"Error playing MP3: {e}")
-            else:
-                logging.error(f"MP3 file not found at path: {MP3_FILE_PATH}")
+                voice_client.play(source, after=after_playing)
+                # Send a message to the system channel if available
+                if guild.system_channel:
+                    await guild.system_channel.send(f"Playing welcome sound for {member.mention}!")
+        except Exception as e:
+            logging.error(f"Error playing MP3: {e}")
 
 # =========================
 # Bot Commands
@@ -267,15 +304,11 @@ async def resume(ctx):
 
 @bot.command()
 async def skip(ctx):
-    """Skips the currently playing song. Only the priority user can use this."""
+    """Skips the currently playing song. Any user with the DJ role can use this."""
     voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     if voice_client and voice_client.is_playing():
-        # Only allow skip if the user is the priority user
-        if ctx.author.id == PRIORITY_USER_ID:
-            voice_client.stop()
-            await ctx.send("Skipped the current song.")
-        else:
-            await ctx.send("You don't have permission to skip songs.")
+        voice_client.stop()
+        await ctx.send("Skipped the current song.")
     else:
         await ctx.send("No song is currently playing.")
 
@@ -290,31 +323,80 @@ async def queue(ctx):
 
 @bot.command()
 async def clear(ctx):
-    """Clears the music queue. Only the priority user can use this."""
-    # Only allow clear if the user is the priority user
-    if ctx.author.id == PRIORITY_USER_ID:
-        if ctx.guild.id in music_queues:
-            music_queues[ctx.guild.id].clear()
-            await ctx.send("Cleared the music queue.")
-        else:
-            await ctx.send("The music queue is already empty.")
+    """Clears the music queue. Any user with the DJ role can use this."""
+    if ctx.guild.id in music_queues:
+        music_queues[ctx.guild.id].clear()
+        await ctx.send("Cleared the music queue.")
     else:
-        await ctx.send("You don't have permission to clear the queue.")
+        await ctx.send("The music queue is already empty.")
 
 @bot.command()
 async def stop(ctx):
-    """Stops playing music and disconnects the bot from the voice channel. Only the priority user can use this."""
+    """Stops playing music and disconnects the bot from the voice channel. Any user with the DJ role can use this."""
     voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     if voice_client:
-        # Only allow stop if the user is the priority user
-        if ctx.author.id == PRIORITY_USER_ID:
-            music_queues[ctx.guild.id].clear()
-            await voice_client.disconnect()
-            await ctx.send("Stopped playing and disconnected from the voice channel.")
-        else:
-            await ctx.send("You don't have permission to stop the music.")
+        music_queues[ctx.guild.id].clear()
+        await voice_client.disconnect()
+        await ctx.send("Stopped playing and disconnected from the voice channel.")
     else:
         await ctx.send("I'm not connected to any voice channel.")
+
+# =========================
+# Welcome Sound Management Commands
+# =========================
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setwelcome(ctx, member: discord.Member, *, mp3_file: str):
+    """
+    Sets a specific welcome sound for a user.
+    Usage: !setwelcome @User path/to/file.mp3
+    """
+    # Check if the MP3 file exists
+    if not os.path.isfile(mp3_file):
+        await ctx.send(f"MP3 file not found at path: {mp3_file}")
+        return
+
+    # Update the welcome_sounds dictionary
+    welcome_sounds[str(member.id)] = mp3_file
+    save_welcome_sounds(welcome_sounds)
+    await ctx.send(f"Set welcome sound for {member.mention} to `{mp3_file}`.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removewelcome(ctx, member: discord.Member):
+    """
+    Removes a user's specific welcome sound.
+    Usage: !removewelcome @User
+    """
+    user_id = str(member.id)
+    if user_id in welcome_sounds:
+        del welcome_sounds[user_id]
+        save_welcome_sounds(welcome_sounds)
+        await ctx.send(f"Removed welcome sound for {member.mention}.")
+    else:
+        await ctx.send(f"No specific welcome sound set for {member.mention}.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def listwelcomes(ctx):
+    """
+    Lists all users with specific welcome sounds.
+    Usage: !listwelcomes
+    """
+    if not welcome_sounds:
+        await ctx.send("No specific welcome sounds have been set.")
+        return
+
+    embed = discord.Embed(title="Welcome Sounds", color=discord.Color.blue())
+    for user_id, mp3 in welcome_sounds.items():
+        member = ctx.guild.get_member(int(user_id))
+        if member:
+            embed.add_field(name=member.display_name, value=mp3, inline=False)
+        else:
+            embed.add_field(name=f"User ID: {user_id}", value=mp3, inline=False)
+
+    await ctx.send(embed=embed)
 
 # =========================
 # Running the Bot
